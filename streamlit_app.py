@@ -1,249 +1,212 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
-import altair as alt
-import time
-import zipfile
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import os
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import google.generativeai as genai
+from langchain.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
+import pickle
 
-# Page title
-st.set_page_config(page_title='ML model builder', page_icon='🏗️')
-st.title('🏗️ ML model builder')
+# Load environment variables from .env file
+load_dotenv()
+api_key = os.getenv("GOOGLE_API_KEY")
 
-with st.expander('About this app'):
-  st.markdown('**What can this app do?**')
-  st.info('This app allow users to build a machine learning (ML) model in an end-to-end workflow. Particularly, this encompasses data upload, data pre-processing, ML model building and post-model analysis.')
+# Configure Google Generative AI with the API key
+genai.configure(api_key=api_key)
 
-  st.markdown('**How to use the app?**')
-  st.warning('To engage with the app, go to the sidebar and 1. Select a data set and 2. Adjust the model parameters by adjusting the various slider widgets. As a result, this would initiate the ML model building process, display the model results as well as allowing users to download the generated models and accompanying data.')
+# Define the path to your shared drive
+SHARED_DRIVE_PATH = "G:/Shared drives/BRP Internal"
 
-  st.markdown('**Under the hood**')
-  st.markdown('Data sets:')
-  st.code('''- Drug solubility data set
-  ''', language='markdown')
-  
-  st.markdown('Libraries used:')
-  st.code('''- Pandas for data wrangling
-- Scikit-learn for building a machine learning model
-- Altair for chart creation
-- Streamlit for user interface
-  ''', language='markdown')
+def list_directories(drive_path):
+    """
+    List all directories in the specified path.
+    
+    Args:
+    drive_path (str): The path to list directories from.
+    
+    Returns:
+    list: List of directory names.
+    """
+    return [f.name for f in os.scandir(drive_path) if f.is_dir()]
 
+def list_files(drive_path):
+    """
+    List all PDF files in the specified path.
+    
+    Args:
+    drive_path (str): The path to list files from.
+    
+    Returns:
+    list: List of PDF file names.
+    """
+    return [f.name for f in os.scandir(drive_path) if f.is_file() and f.name.endswith('.pdf')]
 
-# Sidebar for accepting input parameters
-with st.sidebar:
-    # Load data
-    st.header('1.1. Input data')
+def get_pdf_text(file_path):
+    """
+    Extract text from a PDF file along with page numbers.
+    
+    Args:
+    file_path (str): The path to the PDF file.
+    
+    Returns:
+    list: List of tuples containing text and page number.
+    """
+    text = []
+    try:
+        pdf_reader = PdfReader(file_path)
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text.append((page_text, page_num))
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+    return text
 
-    st.markdown('**1. Use custom data**')
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, index_col=False)
-      
-    # Download example data
-    @st.cache_data
-    def convert_df(input_df):
-        return input_df.to_csv(index=False).encode('utf-8')
-    example_csv = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
-    csv = convert_df(example_csv)
-    st.download_button(
-        label="Download example CSV",
-        data=csv,
-        file_name='delaney_solubility_with_descriptors.csv',
-        mime='text/csv',
+def get_text_chunks(text):
+    """
+    Split the text into chunks for processing, keeping track of page numbers.
+    
+    Args:
+    text (list): List of tuples containing text and page number.
+    
+    Returns:
+    list: List of tuples containing text chunks and corresponding page numbers.
+    """
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=500)
+    chunks = []
+    for page_text, page_num in text:
+        splits = text_splitter.split_text(page_text)
+        chunks.extend([(split, page_num) for split in splits])
+    return chunks
+
+def get_vector_store(text_chunks):
+    """
+    Create a vector store from text chunks using embeddings and save page numbers.
+    
+    Args:
+    text_chunks (list): List of tuples containing text chunks and page numbers.
+    """
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    texts = [chunk[0] for chunk in text_chunks]
+    vector_store = FAISS.from_texts(texts, embedding=embeddings)
+    vector_store.save_local("faiss_index")
+    with open("faiss_index/page_numbers.pkl", "wb") as f:
+        pickle.dump(text_chunks, f)
+
+def get_conversational_chain():
+    """
+    Create a conversational chain for question answering.
+    
+    Returns:
+    chain: The question-answering chain configured with the prompt and model.
+    """
+    prompt_template = """
+    Use the provided context to answer the question as accurately as possible. Provide detailed responses and if the information is not available in the context, state that the answer is not available in the context.\n\n
+    Context:\n {context}\n
+    Question: \n{question}\n
+    Answer:
+    """
+
+    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    return chain
+
+def user_input(user_question):
+    """
+    Process user input, perform similarity search, and generate a response.
+    
+    Args:
+    user_question (str): The question asked by the user.
+    """
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    
+    # Load the FAISS index and perform similarity search
+    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    docs = new_db.similarity_search(user_question, k=5)  # Retrieve more documents for better context
+
+    # Get the conversational chain and generate a response
+    chain = get_conversational_chain()
+    response = chain(
+        {"input_documents": docs, "question": user_question},
+        return_only_outputs=True
     )
 
-    # Select example data
-    st.markdown('**1.2. Use example data**')
-    example_data = st.toggle('Load example data')
-    if example_data:
-        df = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
+    # Load text chunks with page numbers
+    with open("faiss_index/page_numbers.pkl", "rb") as f:
+        text_chunks = pickle.load(f)
 
-    st.header('2. Set Parameters')
-    parameter_split_size = st.slider('Data split ratio (% for Training Set)', 10, 90, 80, 5)
+    # Map responses to page numbers
+    response_with_pages = []
+    for doc in docs:
+        for chunk, page_number in text_chunks:
+            if doc.page_content in chunk:
+                response_with_pages.append(page_number)
+                break
 
-    st.subheader('2.1. Learning Parameters')
-    with st.expander('See parameters'):
-        parameter_n_estimators = st.slider('Number of estimators (n_estimators)', 0, 1000, 100, 100)
-        parameter_max_features = st.select_slider('Max features (max_features)', options=['all', 'sqrt', 'log2'])
-        parameter_min_samples_split = st.slider('Minimum number of samples required to split an internal node (min_samples_split)', 2, 10, 2, 1)
-        parameter_min_samples_leaf = st.slider('Minimum number of samples required to be at a leaf node (min_samples_leaf)', 1, 10, 2, 1)
+    # Display the response and the corresponding page numbers
+    st.write("Reply: ", response["output_text"])
+    st.write("Page Number(s): ", sorted(set(response_with_pages)))  # Display unique page numbers in sorted order
 
-    st.subheader('2.2. General Parameters')
-    with st.expander('See parameters', expanded=False):
-        parameter_random_state = st.slider('Seed number (random_state)', 0, 1000, 42, 1)
-        parameter_criterion = st.select_slider('Performance measure (criterion)', options=['squared_error', 'absolute_error', 'friedman_mse'])
-        parameter_bootstrap = st.select_slider('Bootstrap samples when building trees (bootstrap)', options=[True, False])
-        parameter_oob_score = st.select_slider('Whether to use out-of-bag samples to estimate the R^2 on unseen data (oob_score)', options=[False, True])
+def main():
+    """
+    Main function to set up the Streamlit interface and handle user interactions.
+    """
+    st.set_page_config(page_title="Chat PDF")
+    st.header("Chat with PDF using Gemini💁")
 
-    sleep_time = st.slider('Sleep time', 0, 3, 0)
+    # Input field for user's question
+    user_question = st.text_input("Ask a Question from the PDF Files")
 
-# Initiate the model building process
-if uploaded_file or example_data: 
-    with st.status("Running ...", expanded=True) as status:
-    
-        st.write("Loading data ...")
-        time.sleep(sleep_time)
+    if user_question:
+        user_input(user_question)
 
-        st.write("Preparing data ...")
-        time.sleep(sleep_time)
-        X = df.iloc[:,:-1]
-        y = df.iloc[:,-1]
-            
-        st.write("Splitting data ...")
-        time.sleep(sleep_time)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(100-parameter_split_size)/100, random_state=parameter_random_state)
-    
-        st.write("Model training ...")
-        time.sleep(sleep_time)
-
-        if parameter_max_features == 'all':
-            parameter_max_features = None
-            parameter_max_features_metric = X.shape[1]
+    with st.sidebar:
+        st.title("Menu:")
         
-        rf = RandomForestRegressor(
-                n_estimators=parameter_n_estimators,
-                max_features=parameter_max_features,
-                min_samples_split=parameter_min_samples_split,
-                min_samples_leaf=parameter_min_samples_leaf,
-                random_state=parameter_random_state,
-                criterion=parameter_criterion,
-                bootstrap=parameter_bootstrap,
-                oob_score=parameter_oob_score)
-        rf.fit(X_train, y_train)
-        
-        st.write("Applying model to make predictions ...")
-        time.sleep(sleep_time)
-        y_train_pred = rf.predict(X_train)
-        y_test_pred = rf.predict(X_test)
-            
-        st.write("Evaluating performance metrics ...")
-        time.sleep(sleep_time)
-        train_mse = mean_squared_error(y_train, y_train_pred)
-        train_r2 = r2_score(y_train, y_train_pred)
-        test_mse = mean_squared_error(y_test, y_test_pred)
-        test_r2 = r2_score(y_test, y_test_pred)
-        
-        st.write("Displaying performance metrics ...")
-        time.sleep(sleep_time)
-        parameter_criterion_string = ' '.join([x.capitalize() for x in parameter_criterion.split('_')])
-        #if 'Mse' in parameter_criterion_string:
-        #    parameter_criterion_string = parameter_criterion_string.replace('Mse', 'MSE')
-        rf_results = pd.DataFrame(['Random forest', train_mse, train_r2, test_mse, test_r2]).transpose()
-        rf_results.columns = ['Method', f'Training {parameter_criterion_string}', 'Training R2', f'Test {parameter_criterion_string}', 'Test R2']
-        # Convert objects to numerics
-        for col in rf_results.columns:
-            rf_results[col] = pd.to_numeric(rf_results[col], errors='ignore')
-        # Round to 3 digits
-        rf_results = rf_results.round(3)
-        
-    status.update(label="Status", state="complete", expanded=False)
+        # Persistent state to store the current folder path
+        if 'current_folder' not in st.session_state:
+            st.session_state.current_folder = SHARED_DRIVE_PATH
 
-    # Display data info
-    st.header('Input data', divider='rainbow')
-    col = st.columns(4)
-    col[0].metric(label="No. of samples", value=X.shape[0], delta="")
-    col[1].metric(label="No. of X variables", value=X.shape[1], delta="")
-    col[2].metric(label="No. of Training samples", value=X_train.shape[0], delta="")
-    col[3].metric(label="No. of Test samples", value=X_test.shape[0], delta="")
-    
-    with st.expander('Initial dataset', expanded=True):
-        st.dataframe(df, height=210, use_container_width=True)
-    with st.expander('Train split', expanded=False):
-        train_col = st.columns((3,1))
-        with train_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_train, height=210, hide_index=True, use_container_width=True)
-        with train_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_train, height=210, hide_index=True, use_container_width=True)
-    with st.expander('Test split', expanded=False):
-        test_col = st.columns((3,1))
-        with test_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_test, height=210, hide_index=True, use_container_width=True)
-        with test_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_test, height=210, hide_index=True, use_container_width=True)
+        folder_path = st.session_state.current_folder
 
-    # Zip dataset files
-    df.to_csv('dataset.csv', index=False)
-    X_train.to_csv('X_train.csv', index=False)
-    y_train.to_csv('y_train.csv', index=False)
-    X_test.to_csv('X_test.csv', index=False)
-    y_test.to_csv('y_test.csv', index=False)
-    
-    list_files = ['dataset.csv', 'X_train.csv', 'y_train.csv', 'X_test.csv', 'y_test.csv']
-    with zipfile.ZipFile('dataset.zip', 'w') as zipF:
-        for file in list_files:
-            zipF.write(file, compress_type=zipfile.ZIP_DEFLATED)
+        # Navigation through folders
+        st.write(f"Current folder: {folder_path}")
+        subfolders = list_directories(folder_path)
+        subfolders.insert(0, "..")  # Option to go up one level
+        selected_subfolder = st.selectbox("Select Folder", subfolders, key='folder_select')
 
-    with open('dataset.zip', 'rb') as datazip:
-        btn = st.download_button(
-                label='Download ZIP',
-                data=datazip,
-                file_name="dataset.zip",
-                mime="application/octet-stream"
-                )
-    
-    # Display model parameters
-    st.header('Model parameters', divider='rainbow')
-    parameters_col = st.columns(3)
-    parameters_col[0].metric(label="Data split ratio (% for Training Set)", value=parameter_split_size, delta="")
-    parameters_col[1].metric(label="Number of estimators (n_estimators)", value=parameter_n_estimators, delta="")
-    parameters_col[2].metric(label="Max features (max_features)", value=parameter_max_features_metric, delta="")
-    
-    # Display feature importance plot
-    importances = rf.feature_importances_
-    feature_names = list(X.columns)
-    forest_importances = pd.Series(importances, index=feature_names)
-    df_importance = forest_importances.reset_index().rename(columns={'index': 'feature', 0: 'value'})
-    
-    bars = alt.Chart(df_importance).mark_bar(size=40).encode(
-             x='value:Q',
-             y=alt.Y('feature:N', sort='-x')
-           ).properties(height=250)
+        if st.button("Change Folder"):
+            if selected_subfolder == "..":
+                st.session_state.current_folder = os.path.dirname(folder_path)
+            else:
+                st.session_state.current_folder = os.path.join(folder_path, selected_subfolder)
+            st.experimental_rerun()
 
-    performance_col = st.columns((2, 0.2, 3))
-    with performance_col[0]:
-        st.header('Model performance', divider='rainbow')
-        st.dataframe(rf_results.T.reset_index().rename(columns={'index': 'Parameter', 0: 'Value'}))
-    with performance_col[2]:
-        st.header('Feature importance', divider='rainbow')
-        st.altair_chart(bars, theme='streamlit', use_container_width=True)
+        # List PDF files in the selected folder
+        files = list_files(folder_path)
+        st.write("Files in Folder:")
+        for file_name in files:
+            st.write(file_name)
 
-    # Prediction results
-    st.header('Prediction results', divider='rainbow')
-    s_y_train = pd.Series(y_train, name='actual').reset_index(drop=True)
-    s_y_train_pred = pd.Series(y_train_pred, name='predicted').reset_index(drop=True)
-    df_train = pd.DataFrame(data=[s_y_train, s_y_train_pred], index=None).T
-    df_train['class'] = 'train'
-        
-    s_y_test = pd.Series(y_test, name='actual').reset_index(drop=True)
-    s_y_test_pred = pd.Series(y_test_pred, name='predicted').reset_index(drop=True)
-    df_test = pd.DataFrame(data=[s_y_test, s_y_test_pred], index=None).T
-    df_test['class'] = 'test'
-    
-    df_prediction = pd.concat([df_train, df_test], axis=0)
-    
-    prediction_col = st.columns((2, 0.2, 3))
-    
-    # Display dataframe
-    with prediction_col[0]:
-        st.dataframe(df_prediction, height=320, use_container_width=True)
+        # File selector
+        selected_file_name = st.text_input("Enter File Name to Process")
+        if st.button("Process"):
+            with st.spinner("Processing..."):
+                # Access and process the selected file from the local Google Drive directory
+                file_path = os.path.join(folder_path, selected_file_name)
+                if os.path.exists(file_path):
+                    raw_text = get_pdf_text(file_path)
+                    text_chunks = get_text_chunks(raw_text)
+                    get_vector_store(text_chunks)
+                    st.success("Done")
+                else:
+                    st.error(f"File {file_path} not found.")
 
-    # Display scatter plot of actual vs predicted values
-    with prediction_col[2]:
-        scatter = alt.Chart(df_prediction).mark_circle(size=60).encode(
-                        x='actual',
-                        y='predicted',
-                        color='class'
-                  )
-        st.altair_chart(scatter, theme='streamlit', use_container_width=True)
-
-    
-# Ask for CSV upload if none is detected
-else:
-    st.warning('👈 Upload a CSV file or click *"Load example data"* to get started!')
+if __name__ == "__main__":
+    main()
